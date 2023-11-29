@@ -3262,5 +3262,6 @@ struct bpf_struct_ops_##_name {					\
 int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 			     struct btf *btf,
 			     struct bpf_verifier_log *log);
+void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map);
 
 #endif /* _LINUX_BPF_H */
