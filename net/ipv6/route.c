@@ -989,10 +989,20 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
 				 (rt->fib6_flags & ~RTF_PREF_MASK) | RTF_PREF(pref);
 
 	if (rt) {
-		if (!addrconf_finite_timeout(lifetime))
+		spin_lock_bh(&rt->fib6_table->tb6_lock);
+		if (!addrconf_finite_timeout(lifetime)) {
 			fib6_clean_expires(rt);
-		else
-			fib6_set_expires(rt, jiffies + HZ * lifetime);
+			fib6_remove_gc_list(rt);
+		} else {
+			fib6_set_expires(rt, jiffies + (HZ * lifetime));
+			/* If fib6_node is null, the f6i is just removed
+			 * from the table.
+			 */
+			if (rcu_dereference_protected(rt->fib6_node,
+						      lockdep_is_held(&rt->fib6_table->tb6_lock)))
+				fib6_add_gc_list(rt);
+		}
+		spin_unlock_bh(&rt->fib6_table->tb6_lock);
 
 		fib6_info_release(rt);
 	}

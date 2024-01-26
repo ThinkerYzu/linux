@@ -1410,8 +1410,17 @@ static enum skb_drop_reason ndisc_router_discovery(struct sk_buff *skb)
 		inet6_rt_notify(RTM_NEWROUTE, rt, &nlinfo, NLM_F_REPLACE);
 	}
 
-	if (rt)
+	if (rt) {
+		spin_lock_bh(&rt->fib6_table->tb6_lock);
 		fib6_set_expires(rt, jiffies + (HZ * lifetime));
+		/* If fib6_node is null, the f6i is just removed from the
+		 * table.
+		 */
+		if (rcu_dereference_protected(rt->fib6_node,
+					      lockdep_is_held(&rt->fib6_table->tb6_lock)))
+			fib6_add_gc_list(rt);
+		spin_unlock_bh(&rt->fib6_table->tb6_lock);
+	}
 	if (in6_dev->cnf.accept_ra_min_hop_limit < 256 &&
 	    ra_msg->icmph.icmp6_hop_limit) {
 		if (in6_dev->cnf.accept_ra_min_hop_limit <= ra_msg->icmph.icmp6_hop_limit) {
