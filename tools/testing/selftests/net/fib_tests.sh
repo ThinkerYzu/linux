@@ -768,7 +768,7 @@ fib6_gc_test()
 	    $IP -6 route add 2001:20::$i \
 		via 2001:10::2 dev dummy_10 expires $EXPIRE
 	done
-	sleep $(($EXPIRE * 2))
+	sleep $(($EXPIRE * 2 + 1))
 	N_EXP_SLEEP=$($IP -6 route list |grep expires|wc -l)
 	if [ $N_EXP_SLEEP -ne 0 ]; then
 	    echo "FAIL: expected 0 routes with expires, got $N_EXP_SLEEP"
@@ -776,6 +776,15 @@ fib6_gc_test()
 	else
 	    ret=0
 	fi
+
+	log_test $ret 0 "ipv6 route garbage collection"
+
+	# Delete dummy_10 and remove all routes
+	$IP link del dev dummy_10
+
+	$IP link add dummy_10 type dummy
+	$IP link set dev dummy_10 up
+	$IP -6 address add 2001:10::1/64 dev dummy_10
 
 	# Permanent routes
 	for i in $(seq 1 5000); do
@@ -788,7 +797,7 @@ fib6_gc_test()
 	    $IP -6 route add 2001:20::$i \
 		via 2001:10::2 dev dummy_10 expires $EXPIRE
 	done
-	sleep $(($EXPIRE * 2))
+	sleep $(($EXPIRE * 2 + 1))
 	N_EXP_SLEEP=$($IP -6 route list |grep expires|wc -l)
 	if [ $N_EXP_SLEEP -ne 0 ]; then
 	    echo "FAIL: expected 0 routes with expires," \
@@ -798,9 +807,148 @@ fib6_gc_test()
 	    ret=0
 	fi
 
-	set +e
+	log_test $ret 0 "ipv6 route garbage collection (with permanent routes)"
 
-	log_test $ret 0 "ipv6 route garbage collection"
+	# Delete dummy_10 and remove all routes
+	$IP link del dev dummy_10
+
+	$IP link add dummy_10 type dummy
+	$IP link set dev dummy_10 up
+	$IP -6 address add 2001:10::1/64 dev dummy_10
+
+	# Permanent routes
+	for i in $(seq 1 100); do
+	    # Expire route after $EXPIRE seconds
+	    $IP -6 route add 2001:20::$i \
+		via 2001:10::2 dev dummy_10
+	done
+	# Replace with temporary routes
+	for i in $(seq 1 100); do
+	    # Expire route after $EXPIRE seconds
+	    $IP -6 route replace 2001:20::$i \
+		via 2001:10::2 dev dummy_10 expires $EXPIRE
+	done
+	N_EXP_SLEEP=$($IP -6 route list |grep expires|wc -l)
+	if [ $N_EXP_SLEEP -ne 100 ]; then
+	    log_test 1 0 "expected 100 routes with expires, got $N_EXP_SLEEP"
+	    set +e
+	    cleanup &> /dev/null
+	    return
+	fi
+	# Wait for GC
+	sleep $(($EXPIRE * 2 + 1))
+	N_EXP_SLEEP=$($IP -6 route list |grep expires|wc -l)
+	if [ $N_EXP_SLEEP -ne 0 ]; then
+	    echo "FAIL: expected 0 routes with expires," \
+		 "got $N_EXP_SLEEP"
+	    ret=1
+	else
+	    ret=0
+	fi
+
+	log_test $ret 0 "ipv6 route garbage collection (replace with expires)"
+
+	# Delete dummy_10 and remove all routes
+	$IP link del dev dummy_10
+
+	$IP link add dummy_10 type dummy
+	$IP link set dev dummy_10 up
+	$IP -6 address add 2001:10::1/64 dev dummy_10
+
+	PERM_BASE=$($IP -6 route list |grep -v expires|wc -l)
+	# Temporary routes
+	for i in $(seq 1 100); do
+	    # Expire route after $EXPIRE seconds
+	    $IP -6 route add 2001:20::$i \
+		via 2001:10::2 dev dummy_10 expires $EXPIRE
+	done
+	# Replace with permanent routes
+	for i in $(seq 1 100); do
+	    # Expire route after $EXPIRE seconds
+	    $IP -6 route replace 2001:20::$i \
+		via 2001:10::2 dev dummy_10
+	done
+	N_EXP_SLEEP=$($IP -6 route list |grep expires|wc -l)
+	if [ $N_EXP_SLEEP -ne 0 ]; then
+	    log_test 1 0 "expected 0 routes with expires," \
+		     "got $N_EXP_SLEEP"
+	    set +e
+	    cleanup &> /dev/null
+	    return
+	fi
+
+	# Wait for GC
+	sleep $(($EXPIRE * 2 + 1))
+
+	N_EXP_PERM=$($IP -6 route list |grep -v expires|wc -l)
+	N_EXP_PERM=$(($N_EXP_PERM - $PERM_BASE))
+	if [ $N_EXP_PERM -ne 100 ]; then
+	    echo "FAIL: expected 100 permanent routes," \
+		 "got $N_EXP_PERM"
+	    ret=1
+	else
+	    ret=0
+	fi
+
+	log_test $ret 0 "ipv6 route garbage collection (replace with permanent)"
+
+	# Delete dummy_10 and remove all routes
+	$IP link del dev dummy_10
+
+	$IP link add veth1 type veth peer name veth2
+	$IP link set dev veth1 up
+	$IP link set dev veth2 up
+	$IP -6 address add 2001:10::1/64 dev veth1 nodad
+	$IP -6 address add 2001:10::2/64 dev veth2 nodad
+
+	# Routes received from RA
+	if [ ! -x "$(command -v ra6)" ]; then
+	    echo "SKIP: ra6 not found."
+	    set +e
+	    cleanup &> /dev/null
+	    return 0
+	fi
+
+	# Without stop these two services, systemd will interfere with the
+	# test.
+	if [ -x "$(command -v systemctl)" ]; then
+	    systemctl stop systemd-networkd.socket
+	    systemctl stop systemd-networkd.service
+	fi
+	# Enable RA handling in the kernel for veth1
+	$NS_EXEC sysctl -w net.ipv6.conf.veth1.accept_ra=2 &> /dev/null
+	$NS_EXEC sysctl -w net.ipv6.conf.veth1.accept_ra_rt_info_max_plen=127 &> /dev/null
+
+	# Send a RA message with a route
+	$NS_EXEC ra6 -i veth2 -d 2001:10::1 -R '2003:10::/64#1#$EXPIRE' -t $EXPIRE
+
+	# Wait for the route to be added
+	sleep 1
+
+	N_EXP=$($IP -6 route list |grep expires|wc -l)
+	if [ $N_EXP -ne 1 ]; then
+	    log_test 1 0 "expected 1 routes with expires," \
+		     "got $N_EXP"
+	    set +e
+	    cleanup &> /dev/null
+	    return
+	fi
+
+	# Wait for GC
+	sleep $(($EXPIRE * 2 + 1))
+
+	N_EXP=$($IP -6 route list |grep expires|wc -l)
+	if [ $N_EXP -ne 0 ]; then
+	    echo "FAIL: expected 0 routes with expires," \
+		 "got $N_EXP"
+	    ret=1
+	else
+	    ret=0
+	fi
+
+	log_test $ret 0 "ipv6 route garbage collection (RA message)"
+
+	set +e
 
 	cleanup &> /dev/null
 }
