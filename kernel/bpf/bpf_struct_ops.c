@@ -116,17 +116,233 @@ static bool is_valid_value_type(struct btf *btf, s32 value_id,
 	return true;
 }
 
+#define MAYBE_NULL_SUFFIX "__nullable"
+#define OVERRIDE_SUFFIX "__override"
+#define MAX_STUB_NAME 128
+
+/* Match __nullable and __override suffixes.
+ *
+ * __nullable makes the argument PTR_MAYBE_NULL and __override doesn't.
+ *
+ * The purpose of __override is to allow the user to override/promote the
+ * pointer type of an argument.
+ */
+static bool match_arg_suffix(const char *name, bool *nullable)
+{
+	int len;
+
+	if (!name)
+		return false;
+
+	len = strlen(name);
+
+	*nullable = len >= sizeof(MAYBE_NULL_SUFFIX) &&
+		!strcmp(name + len - sizeof(MAYBE_NULL_SUFFIX) + 1,
+			MAYBE_NULL_SUFFIX);
+	if (*nullable)
+		return true;
+
+	return (len >= sizeof(OVERRIDE_SUFFIX) &&
+		!strcmp(name + len - sizeof(OVERRIDE_SUFFIX) + 1,
+			OVERRIDE_SUFFIX));
+}
+
+/* Return the type info of a stub function, if it exists.
+ *
+ * The name of the stub function is made up of the name of the struct_ops
+ * and the name of the function pointer member, separated by "__". For
+ * example, if the struct_ops is named "foo_ops" and the function pointer
+ * member is named "bar", the stub function name would be "foo_ops__bar".
+ */
+static const  struct btf_type *
+find_stub_func_proto(struct btf *btf, const char *st_op_name,
+		     const char *member_name)
+{
+	char stub_func_name[MAX_STUB_NAME];
+	const struct btf_type *t, *func_proto;
+	s32 btf_id;
+
+	snprintf(stub_func_name, MAX_STUB_NAME, "%s__%s",
+		 st_op_name, member_name);
+	btf_id = btf_find_by_name_kind(btf, stub_func_name, BTF_KIND_FUNC);
+	if (btf_id < 0)
+		return NULL;
+	t = btf_type_by_id(btf, btf_id);
+	if (!t)
+		return NULL;
+	func_proto = btf_type_by_id(btf, t->type);
+
+	return func_proto;
+}
+
+/* The number of arguments should be the same as the function pointer, and
+ * the size of each argument must match the size of the corresponding
+ * argument in the function pointer type.
+ *
+ * The type of an argument int the stub function doesn't have to match the
+ * type of the corresponding argument in the function pointer type, so that
+ * we can promote or override the type of the argument.
+ */
+static bool compatible_stub_func(struct btf *btf,
+				 const struct btf_param *stub_args,
+				 u32 stub_nargs,
+				 const struct btf_param *mem_args,
+				 u32 mem_nargs,
+				 const char *st_ops_name,
+				 const char *member_name)
+{
+	const struct btf_type *s_arg_type, *m_arg_type;
+	u32 s_arg_sz, m_arg_sz;
+	u32 arg_no;
+
+	if (stub_nargs != mem_nargs) {
+		pr_warn("the number of arguments of the stub function %s__%s does not match the number of arguments of the member %s of struct %s\n",
+			st_ops_name, member_name, member_name, st_ops_name);
+		return false;
+	}
+
+	/* Make sure the size of arguments are the same as the
+	 * corresponding ones in the function pointer.
+	 */
+	for (arg_no = 0; arg_no < stub_nargs; arg_no++) {
+		s_arg_type = btf_type_by_id(btf, stub_args[arg_no].type);
+		s_arg_type = btf_resolve_size(btf, s_arg_type, &s_arg_sz);
+		if (IS_ERR(s_arg_type)) {
+			pr_warn("failed to resolve size of argument %d of the stub function %s__%s\n",
+				arg_no, st_ops_name, member_name);
+			return false;
+		}
+		m_arg_type = btf_type_by_id(btf, mem_args[arg_no].type);
+		m_arg_type = btf_resolve_size(btf, m_arg_type, &m_arg_sz);
+		if (IS_ERR(m_arg_type)) {
+			pr_warn("failed to resolve size of argument %d of the member %s of struct %s\n",
+				arg_no, member_name, st_ops_name);
+			return false;
+		}
+		if (s_arg_sz != m_arg_sz) {
+			pr_warn("the size of argument %d of the stub function %s__%s does not match the size of argument %d of the member %s of struct %s\n",
+				arg_no, st_ops_name, member_name, arg_no, member_name, st_ops_name);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/* Prepare argument info for every nullable argument of a member of a
+ * struct_ops type.
+ *
+ * Initialize a struct bpf_struct_ops_member_arg_info according to type
+ * info of the arguments of a stub function. (Check kCFI for more
+ * information about stub functions.)
+ *
+ * Each member in the struct_ops type has a struct
+ * bpf_struct_ops_member_arg_info to provide an array of struct
+ * bpf_ctx_arg_aux, which in turn provides the information that used by the
+ * verifier to check the arguments of the BPF struct_ops program assigned
+ * to the member. Here, we only care about the arguments that are marked as
+ * __nullable and __override.
+ *
+ * The array of struct bpf_ctx_arg_aux is eventually assigned to
+ * prog->aux->ctx_arg_info of BPF struct_ops programs and passed to the
+ * verifier. (See check_struct_ops_btf_id())
+ *
+ * member_arg_info->arg_info will be the list of struct bpf_ctx_arg_aux if
+ * success. If fails, it will be kept untouched.
+ */
+static int prepare_arg_info(struct btf *btf,
+			    const char *st_ops_name,
+			    const char *member_name,
+			    const struct btf_type *func_proto,
+			    struct bpf_struct_ops_member_arg_info *member_arg_info)
+{
+	const struct btf_type *stub_func_proto, *ptr_type;
+	struct bpf_ctx_arg_aux *arg_info, *ai_buf = NULL;
+	u32 nargs, arg_no, arg_info_cnt = 0;
+	const struct btf_param *args;
+	const char *arg_name;
+	s32 arg_btf_id;
+	bool nullable;
+	int offset;
+
+	stub_func_proto = find_stub_func_proto(btf, st_ops_name, member_name);
+	if (!stub_func_proto)
+		return 0;
+
+	args = btf_params(stub_func_proto);
+	nargs = btf_type_vlen(stub_func_proto);
+	if (!compatible_stub_func(btf, args, nargs,
+				  btf_params(func_proto),
+				  btf_type_vlen(func_proto),
+				  st_ops_name, member_name))
+		return -EINVAL;
+
+	ai_buf = kcalloc(nargs, sizeof(*ai_buf), GFP_KERNEL);
+	if (!ai_buf)
+		return -ENOMEM;
+
+	for (arg_no = 0; arg_no < nargs; arg_no++) {
+		/* Skip arguments that is not suffixed with
+		 * "__nullable".
+		 */
+		arg_name = btf_name_by_offset(btf,
+					      args[arg_no].name_off);
+		if (!match_arg_suffix(arg_name, &nullable))
+			continue;
+
+		/* Should be a pointer to struct, array, scalar, or enum */
+		ptr_type = btf_type_resolve_ptr(btf, args[arg_no].type,
+						&arg_btf_id);
+		if (!ptr_type ||
+		    !btf_type_is_struct(ptr_type))
+			goto err_out;
+
+		offset = btf_ctx_arg_offset(btf, stub_func_proto, arg_no);
+		if (offset < 0)
+			goto err_out;
+
+		/* Fill the information of the new argument */
+		arg_info = ai_buf + arg_info_cnt++;
+		arg_info->reg_type = PTR_TRUSTED | PTR_TO_BTF_ID;
+		/* Mark only nullable pointers with PTR_MAYBE_NULL. For
+		 * overrided pointers, they are used to override the type
+		 * the pointer pointing to, so they are not nullable. If
+		 * you would like a pointer to be nullable and overrided,
+		 * you just need to annotate it with __nullable.
+		 */
+		if (nullable)
+			arg_info->reg_type |= PTR_MAYBE_NULL;
+		arg_info->btf_id = arg_btf_id;
+		arg_info->btf = btf;
+		arg_info->offset = offset;
+	}
+
+	if (arg_info_cnt) {
+		member_arg_info->arg_info = ai_buf;
+		member_arg_info->arg_info_cnt = arg_info_cnt;
+	} else
+		kfree(ai_buf);
+
+	return 0;
+
+err_out:
+	kfree(ai_buf);
+
+	return -EINVAL;
+}
+
 int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 			     struct btf *btf,
 			     struct bpf_verifier_log *log)
 {
+	struct bpf_struct_ops_member_arg_info *member_arg_info;
 	struct bpf_struct_ops *st_ops = st_ops_desc->st_ops;
 	const struct btf_member *member;
 	const struct btf_type *t;
 	s32 type_id, value_id;
 	char value_name[128];
 	const char *mname;
-	int i;
+	int i, err;
 
 	if (strlen(st_ops->name) + VALUE_PREFIX_LEN >=
 	    sizeof(value_name)) {
@@ -160,6 +376,11 @@ int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 	if (!is_valid_value_type(btf, value_id, t, value_name))
 		return -EINVAL;
 
+	member_arg_info = kcalloc(btf_type_vlen(t), sizeof(*member_arg_info),
+				  GFP_KERNEL);
+	if (!member_arg_info)
+		return -ENOMEM;
+
 	for_each_member(i, t, member) {
 		const struct btf_type *func_proto;
 
@@ -167,32 +388,44 @@ int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 		if (!*mname) {
 			pr_warn("anon member in struct %s is not supported\n",
 				st_ops->name);
-			return -EOPNOTSUPP;
+			err = -EOPNOTSUPP;
+			goto errout;
 		}
 
 		if (__btf_member_bitfield_size(t, member)) {
 			pr_warn("bit field member %s in struct %s is not supported\n",
 				mname, st_ops->name);
-			return -EOPNOTSUPP;
+			err = -EOPNOTSUPP;
+			goto errout;
 		}
 
 		func_proto = btf_type_resolve_func_ptr(btf,
 						       member->type,
 						       NULL);
-		if (func_proto &&
-		    btf_distill_func_proto(log, btf,
+		if (!func_proto)
+			continue;
+
+		if (btf_distill_func_proto(log, btf,
 					   func_proto, mname,
 					   &st_ops->func_models[i])) {
 			pr_warn("Error in parsing func ptr %s in struct %s\n",
 				mname, st_ops->name);
-			return -EINVAL;
+			err = -EINVAL;
+			goto errout;
 		}
+
+		err = prepare_arg_info(btf, st_ops->name, mname,
+				       func_proto,
+				       member_arg_info + i);
+		if (err)
+			goto errout;
 	}
 
 	if (st_ops->init(btf)) {
 		pr_warn("Error in init bpf_struct_ops %s\n",
 			st_ops->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto errout;
 	}
 
 	st_ops_desc->type_id = type_id;
@@ -200,7 +433,16 @@ int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 	st_ops_desc->value_id = value_id;
 	st_ops_desc->value_type = btf_type_by_id(btf, value_id);
 
+	st_ops_desc->member_arg_info = member_arg_info;
+
 	return 0;
+
+errout:
+	while (i > 0)
+		kfree(member_arg_info[--i].arg_info);
+	kfree(member_arg_info);
+
+	return err;
 }
 
 static int bpf_struct_ops_map_get_next_key(struct bpf_map *map, void *key,
