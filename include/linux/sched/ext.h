@@ -153,6 +153,7 @@ struct sched_ext_entity {
 #endif
 	u64			ddsp_dsq_id;
 	u64			ddsp_enq_flags;
+	u32			last_cb_called;
 
 	/* BPF scheduler modifiable fields */
 

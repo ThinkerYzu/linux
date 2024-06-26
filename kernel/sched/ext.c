@@ -778,6 +778,8 @@ struct static_key_false scx_has_op[SCX_OPI_END] =
 	{ [0 ... SCX_OPI_END-1] = STATIC_KEY_FALSE_INIT };
 
 static atomic_t scx_exit_kind = ATOMIC_INIT(SCX_EXIT_DONE);
+static atomic_t scx_exited = ATOMIC_INIT(0);
+static atomic_t scx_exiter = ATOMIC_INIT(-1);
 static struct scx_exit_info *scx_exit_info;
 
 static atomic_long_t scx_nr_rejected = ATOMIC_LONG_INIT(0);
@@ -1857,8 +1859,23 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
 	rq->scx.nr_running++;
 	add_nr_running(rq, 1);
 
-	if (SCX_HAS_OP(runnable))
+	if (SCX_HAS_OP(runnable)) {
+		if (READ_ONCE(p->scx.last_cb_called) != 0 &&
+		    READ_ONCE(p->scx.last_cb_called) != 4) {
+			pr_warn("%s[%d] RUNNABLE unexpected last cb %u", p->comm, p->pid, p->scx.last_cb_called);
+			WARN_ON_ONCE(1);
+		}
+		int from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
 		SCX_CALL_OP_TASK(SCX_KF_REST, runnable, p, enq_flags);
+		from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		WRITE_ONCE(p->scx.last_cb_called, 1);
+	}
 
 	if (enq_flags & SCX_ENQ_WAKEUP)
 		touch_core_sched(rq, p);
@@ -1935,12 +1952,40 @@ static void dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags
 	 * skipping the callbacks if the task is !QUEUED.
 	 */
 	if (SCX_HAS_OP(stopping) && task_current(rq, p)) {
+		if (READ_ONCE(p->scx.last_cb_called) != 2) {
+			pr_warn("%s[%d] STOPPING 1 unexpected last cb %u", p->comm, p->pid, p->scx.last_cb_called);
+			WARN_ON_ONCE(1);
+		}
 		update_curr_scx(rq);
+		int from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		from = 0;
 		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, false);
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		WRITE_ONCE(p->scx.last_cb_called, 3);
 	}
 
-	if (SCX_HAS_OP(quiescent))
+	if (SCX_HAS_OP(quiescent)) {
+		if (READ_ONCE(p->scx.last_cb_called) != 1 &&
+		    READ_ONCE(p->scx.last_cb_called) != 3) {
+			pr_warn("%s[%d] QUIESCENT unexpected last cb %u", p->comm, p->pid, p->scx.last_cb_called);
+			WARN_ON_ONCE(1);
+		}
+		int from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
 		SCX_CALL_OP_TASK(SCX_KF_REST, quiescent, p, deq_flags);
+		from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		WRITE_ONCE(p->scx.last_cb_called, 4);
+	}
 
 	if (deq_flags & SCX_DEQ_SLEEP)
 		p->scx.flags |= SCX_TASK_DEQD_FOR_SLEEP;
@@ -2598,8 +2643,23 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
 	p->se.exec_start = rq_clock_task(rq);
 
 	/* see dequeue_task_scx() on why we skip when !QUEUED */
-	if (SCX_HAS_OP(running) && (p->scx.flags & SCX_TASK_QUEUED))
+	if (SCX_HAS_OP(running) && (p->scx.flags & SCX_TASK_QUEUED)) {
+		if (READ_ONCE(p->scx.last_cb_called) != 1 &&
+		    READ_ONCE(p->scx.last_cb_called) != 3) {
+			pr_warn("%s[%d] RUNNING unexpected last cb %u", p->comm, p->pid, p->scx.last_cb_called);
+			WARN_ON_ONCE(1);
+		}
+		int from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
 		SCX_CALL_OP_TASK(SCX_KF_REST, running, p);
+		from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		WRITE_ONCE(p->scx.last_cb_called, 2);
+	}
 
 	clr_task_runnable(p, true);
 
@@ -2662,8 +2722,22 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p)
 	update_curr_scx(rq);
 
 	/* see dequeue_task_scx() on why we skip when !QUEUED */
-	if (SCX_HAS_OP(stopping) && (p->scx.flags & SCX_TASK_QUEUED))
+	if (SCX_HAS_OP(stopping) && (p->scx.flags & SCX_TASK_QUEUED)) {
+		if (READ_ONCE(p->scx.last_cb_called) != 2) {
+			pr_warn("%s[%d] STOPPING 0 unexpected last cb %u", p->comm, p->pid, p->scx.last_cb_called);
+			WARN_ON_ONCE(1);
+		}
+		int from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
 		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, true);
+		from = 0;
+		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
+			WARN_ON_ONCE(1);
+		}
+		WRITE_ONCE(p->scx.last_cb_called, 3);
+	}
 
 	/*
 	 * If we're being called from put_prev_task_balance(), balance_scx() may
@@ -4427,6 +4501,8 @@ static __printf(3, 4) void scx_ops_exit_kind(enum scx_exit_kind kind,
 	ei->kind = kind;
 	ei->reason = scx_exit_reason(ei->kind);
 
+	pr_info("scx_bpf_error() called!!");
+	atomic_set(&scx_exiter, current->pid);
 	irq_work_queue(&scx_ops_error_irq_work);
 }
 

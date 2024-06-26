@@ -521,8 +521,7 @@ req_retry_pinned:
 			goto req_retry_pinned;
 		} else {
 			spin_unlock_irqrestore(&chan->lock, flags);
-			p9_debug(P9_DEBUG_TRANS,
-				 "virtio rpc add_sgs returned failure\n");
+			pr_err("virtio rpc add_sgs returned failure\n");
 			err = -EIO;
 			goto err_out;
 		}
@@ -556,7 +555,7 @@ err_out:
 	}
 	kvfree(in_pages);
 	kvfree(out_pages);
-	if (!kicked) {
+	if (!kicked && err != -ERESTARTSYS) {
 		/* reply won't come */
 		p9_req_put(client, req);
 	}
