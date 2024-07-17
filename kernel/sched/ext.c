@@ -1869,6 +1869,7 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
 			WARN_ON_ONCE(1);
 		}
+		p->scx.last_cb_calleds[(p->scx.last_cb_called_idx++)%4] = 1;
 		SCX_CALL_OP_TASK(SCX_KF_REST, runnable, p, enq_flags);
 		from = 0;
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
@@ -1962,6 +1963,7 @@ static void dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags
 			WARN_ON_ONCE(1);
 		}
 		from = 0;
+		p->scx.last_cb_calleds[(p->scx.last_cb_called_idx++)%4] = 3;
 		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, false);
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
 			WARN_ON_ONCE(1);
@@ -1979,6 +1981,7 @@ static void dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
 			WARN_ON_ONCE(1);
 		}
+		p->scx.last_cb_calleds[(p->scx.last_cb_called_idx++)%4] = 4;
 		SCX_CALL_OP_TASK(SCX_KF_REST, quiescent, p, deq_flags);
 		from = 0;
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
@@ -2653,6 +2656,7 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
 			WARN_ON_ONCE(1);
 		}
+		p->scx.last_cb_calleds[(p->scx.last_cb_called_idx++)%4] = 2;
 		SCX_CALL_OP_TASK(SCX_KF_REST, running, p);
 		from = 0;
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
@@ -2731,6 +2735,7 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p)
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
 			WARN_ON_ONCE(1);
 		}
+		p->scx.last_cb_calleds[(p->scx.last_cb_called_idx++)%4] = 3;
 		SCX_CALL_OP_TASK(SCX_KF_REST, stopping, p, true);
 		from = 0;
 		if (atomic_read(&scx_exiter) == current->pid && atomic_try_cmpxchg(&scx_exited, &from, 1)) {
